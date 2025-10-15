@@ -27,6 +27,7 @@ const userSchema = new mongoose.Schema(
     receiveNotifications: { type: Boolean, default: true },
     twoFA: { type: Boolean, default: false },
     avatar: { type: String }, // URL
+    pushToken: { type: String },
     joinedAt: { type: Date, default: Date.now },
     isDeleted: { type: Boolean, default: false },
     isSuspended: { type: Boolean, default: false },

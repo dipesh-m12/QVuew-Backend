@@ -16,12 +16,6 @@ const workingHoursSchema = new mongoose.Schema({
   sat: { openTime: String, closeTime: String, isClosed: Boolean },
 });
 
-const helperJointBusinessSchema = new mongoose.Schema({
-  name: String,
-  code: String,
-  date: Date,
-});
-
 const vendorSchema = new mongoose.Schema(
   {
     _id: { type: String, default: uuidv4 },
@@ -50,10 +44,11 @@ const vendorSchema = new mongoose.Schema(
       time: Number, // in minutes
       status: Boolean,
     },
-    active: { type: Boolean, default: true },
-    joiningCode: { type: String }, // for admin
-    helperJointBusiness: { type: helperJointBusinessSchema },
+    active: { type: Boolean, default: false },
+    joiningCode: { type: String, unique: true }, // Add unique index for joiningCode
+    helperJointBusiness: { type: String, ref: "Vendor" },
     connectedHelpers: [{ type: String, ref: "Vendor" }], // refs to other helpers' UUIDs
+    pushToken: { type: String },
   },
   { timestamps: true }
 );

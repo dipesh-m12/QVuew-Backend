@@ -1,402 +1,284 @@
 const express = require("express");
 const router = express.Router();
-const { body, validationResult } = require("express-validator");
+const mongoose = require("mongoose");
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
+const redis = require("redis");
 const User = require("../models/User");
-const bcrypt = require("bcryptjs");
-const { v4: uuidv4 } = require("uuid");
 const verifyUser = require("../middlewares/verifyUser");
 
-// User Registration
-router.post(
-  "/register",
-  [
-    body("firstName").notEmpty().withMessage("First name is required"),
-    body("lastName").notEmpty().withMessage("Last name is required"),
-    body("phone.dialCode").notEmpty().withMessage("Dial code is required"),
-    body("phone.number").notEmpty().withMessage("Phone number is required"),
-    body("gender")
-      .isIn(["male", "female", "other"])
-      .withMessage("Invalid gender"),
-    body("dob")
-      .isISO8601()
-      .toDate()
-      .withMessage("Valid date of birth is required"),
-    body("email").trim().isEmail().withMessage("Valid email is required"),
-    body("password")
-      .isLength({ min: 6 })
-      .withMessage("Password must be at least 6 characters"),
-  ],
-  async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({
-        status: "error",
-        message: "Validation failed",
-        data: errors.array(),
-      });
-    }
+const redisClient = redis.createClient({ url: process.env.REDIS_URL });
+redisClient.connect().catch(console.error);
 
-    const { firstName, lastName, phone, gender, dob, email, password } =
-      req.body;
+const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
+const SESSION_DURATION = "1d"; // Login session duration
 
-    try {
-      // Check for existing email, including soft-deleted accounts
-      const existingUser = await User.findOne({ email });
-      if (existingUser) {
-        if (existingUser.isDeleted) {
-          await User.deleteOne({ _id: existingUser._id });
-        } else {
-          return res.status(400).json({
-            status: "error",
-            message: "Email already exists",
-            data: null,
-          });
-        }
-      }
+// Register
+router.post("/register", async (req, res) => {
+  const {
+    firstName,
+    lastName,
+    phone,
+    gender,
+    dob,
+    email,
+    password,
+    pushToken,
+  } = req.body;
 
-      const salt = await bcrypt.genSalt(10);
-      const hashedPassword = await bcrypt.hash(password, salt);
-
-      const user = new User({
-        _id: uuidv4(),
-        firstName,
-        lastName,
-        phone,
-        gender,
-        dob,
-        email,
-        password: hashedPassword,
-      });
-
-      await user.save();
-
-      req.session.userId = user._id;
-      req.session.role = "user";
-
-      res.status(201).json({
-        status: "success",
-        message: "User registered successfully",
-        data: null,
-      });
-    } catch (err) {
-      res.status(500).json({
-        status: "error",
-        message: "Server error",
-        data: { error: err.message },
-      });
+  const existingUser = await User.findOne({ email });
+  if (existingUser) {
+    if (existingUser.isDeleted) {
+      await User.deleteOne({ _id: existingUser._id }); // Hard delete previous deleted account
+    } else {
+      return res
+        .status(400)
+        .json({ success: false, message: "Email already in use", data: null });
     }
   }
-);
 
-// User Login
-router.post(
-  "/login",
-  [
-    body("email").trim().isEmail().withMessage("Valid email is required"),
-    body("password").notEmpty().withMessage("Password is required"),
-  ],
-  async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({
-        status: "error",
-        message: "Validation failed",
-        data: errors.array(),
-      });
-    }
+  const hashedPassword = await bcrypt.hash(password, 10);
+  const user = new User({
+    firstName,
+    lastName,
+    phone,
+    gender,
+    dob,
+    email,
+    password: hashedPassword,
+    pushToken,
+  });
+  await user.save();
 
-    const { email, password } = req.body;
+  res
+    .status(201)
+    .json({ success: true, message: "Registration successful", data: null });
+});
 
-    try {
-      const user = await User.findOne({ email, isDeleted: false });
-      if (!user) {
-        return res.status(400).json({
-          status: "error",
-          message: "Invalid credentials",
-          data: null,
-        });
-      }
-
-      if (user.isSuspended) {
-        return res.status(403).json({
-          status: "error",
-          message: "Account is suspended",
-          data: null,
-        });
-      }
-
-      const isMatch = await bcrypt.compare(password, user.password);
-      if (!isMatch) {
-        return res.status(400).json({
-          status: "error",
-          message: "Invalid credentials",
-          data: null,
-        });
-      }
-
-      req.session.userId = user._id;
-      req.session.role = "user";
-
-      res
-        .status(200)
-        .json({ status: "success", message: "Login successful", data: user });
-    } catch (err) {
-      res.status(500).json({
-        status: "error",
-        message: "Server error",
-        data: { error: err.message },
-      });
-    }
+// Login
+router.post("/login", async (req, res) => {
+  const { email, password } = req.body;
+  const user = await User.findOne({
+    email,
+    isDeleted: false,
+    isSuspended: false,
+  });
+  if (!user || !(await bcrypt.compare(password, user.password))) {
+    return res
+      .status(401)
+      .json({ success: false, message: "Invalid credentials", data: null });
   }
-);
+
+  const session = `user:${user._id}:${Date.now()}`;
+  const token = jwt.sign({ id: user._id, type: "user", session }, JWT_SECRET, {
+    expiresIn: SESSION_DURATION,
+  });
+  await redisClient.setEx(
+    session,
+    24 * 60 * 60,
+    JSON.stringify({ id: user._id, type: "user" })
+  );
+  await redisClient.sAdd(`activeSessions:${user._id}`, session); // Add session to set
+
+  res.json({
+    success: true,
+    message: "Login successful",
+    data: null,
+    token,
+  });
+});
+
+// Auto Login
+router.get("/autologin", verifyUser, async (req, res) => {
+  const user = await User.findById(req.user.id).select("-password");
+  if (!user)
+    return res
+      .status(404)
+      .json({ success: false, message: "User not found", data: null });
+  if (user.isDeleted)
+    return res
+      .status(403)
+      .json({ success: false, message: "Account is deleted", data: null });
+  if (user.isSuspended)
+    return res
+      .status(403)
+      .json({ success: false, message: "Account is suspended", data: null });
+
+  res.json({
+    success: true,
+    message: "Auto login successful",
+    data: { user },
+    token: req.headers["authorization"].split(" ")[1],
+  });
+});
 
 // Change Password
-router.post(
-  "/change-password",
-  [
-    body("currentPassword")
-      .notEmpty()
-      .withMessage("Current password is required"),
-    body("newPassword")
-      .isLength({ min: 6 })
-      .withMessage("New password must be at least 6 characters"),
-  ],
-  verifyUser,
-  async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({
-        status: "error",
-        message: "Validation failed",
-        data: errors.array(),
-      });
-    }
+router.post("/change-password", verifyUser, async (req, res) => {
+  const { oldPassword, newPassword } = req.body;
 
-    const { currentPassword, newPassword } = req.body;
-
-    try {
-      const user = await User.findById(req.session.userId);
-      if (!user || user.isDeleted) {
-        return res.status(401).json({
-          status: "error",
-          message: "Account deleted or not found",
-          data: null,
-        });
-      }
-
-      const isMatch = await bcrypt.compare(currentPassword, user.password);
-      if (!isMatch) {
-        return res.status(400).json({
-          status: "error",
-          message: "Invalid current password",
-          data: null,
-        });
-      }
-
-      const salt = await bcrypt.genSalt(10);
-      user.password = await bcrypt.hash(newPassword, salt);
-      await user.save();
-
-      res.status(200).json({
-        status: "success",
-        message: "Password changed successfully",
-        data: null,
-      });
-    } catch (err) {
-      res.status(500).json({
-        status: "error",
-        message: "Server error",
-        data: { error: err.message },
-      });
-    }
+  const user = await User.findById(req.user.id);
+  if (!user || !(await bcrypt.compare(oldPassword, user.password))) {
+    return res
+      .status(401)
+      .json({ success: false, message: "Invalid old password", data: null });
   }
-);
 
-// Update Profile
-router.put(
-  "/update-profile",
-  [
-    body("firstName")
-      .optional()
-      .notEmpty()
-      .withMessage("First name cannot be empty"),
-    body("lastName")
-      .optional()
-      .notEmpty()
-      .withMessage("Last name cannot be empty"),
-    body("phone.dialCode")
-      .optional()
-      .notEmpty()
-      .withMessage("Dial code cannot be empty"),
-    body("phone.number")
-      .optional()
-      .notEmpty()
-      .withMessage("Phone number cannot be empty"),
-    body("gender")
-      .optional()
-      .isIn(["male", "female", "other"])
-      .withMessage("Invalid gender"),
-    body("dob")
-      .optional()
-      .isISO8601()
-      .toDate()
-      .withMessage("Valid date of birth is required"),
-    body("email")
-      .optional()
-      .trim()
-      .isEmail()
-      .withMessage("Valid email is required"),
-    body("receiveNotifications")
-      .optional()
-      .isBoolean()
-      .withMessage("Receive notifications must be a boolean"),
-    body("twoFA").optional().isBoolean().withMessage("2FA must be a boolean"),
-    body("avatar").optional().isString().withMessage("Avatar must be a string"),
-    body("isSuspended")
-      .optional()
-      .isBoolean()
-      .withMessage("Suspended status must be a boolean"),
-    body("isDeleted")
-      .optional()
-      .isBoolean()
-      .withMessage("Deleted status must be a boolean"),
-    body("deleteReason")
-      .optional()
-      .isString()
-      .withMessage("Delete reason must be a string"),
-  ],
-  verifyUser,
-  async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({
-        status: "error",
-        message: "Validation failed",
-        data: errors.array(),
-      });
-    }
+  user.password = await bcrypt.hash(newPassword, 10);
+  await user.save();
+  res.json({
+    success: true,
+    message: "Password changed successfully",
+    data: null,
+  });
+});
 
-    const {
-      firstName,
-      lastName,
-      phone,
-      gender,
-      dob,
-      email,
-      receiveNotifications,
-      twoFA,
-      avatar,
-      isSuspended,
-      isDeleted,
-      deleteReason,
-    } = req.body;
+// Update Account
+router.put("/update", verifyUser, async (req, res) => {
+  const {
+    firstName,
+    lastName,
+    phone,
+    gender,
+    dob,
+    pushToken,
+    isSuspended,
+    isDeleted,
+    deleteReason,
+    avatar,
+    receiveNotifications,
+    twoFA,
+  } = req.body;
+  const user = await User.findById(req.user.id);
 
-    try {
-      const user = await User.findById(req.session.userId);
-      if (!user || user.isDeleted) {
-        return res.status(401).json({
-          status: "error",
-          message: "Account deleted or not found",
-          data: null,
-        });
-      }
+  if (!user)
+    return res
+      .status(404)
+      .json({ success: false, message: "User not found", data: null });
+  if (isDeleted && !deleteReason)
+    return res
+      .status(400)
+      .json({ success: false, message: "Delete reason required", data: null });
 
-      // Only admins can toggle isSuspended or isDeleted
-      //   if (
-      //     (isSuspended !== undefined || isDeleted !== undefined) &&
-      //     req.session.role !== "admin"
-      //   ) {
-      //     return res.status(403).json({
-      //       status: "error",
-      //       message: "Unauthorized to change suspension or deletion status",
-      //       data: null,
-      //     });
-      //   }
+  user.firstName = firstName || user.firstName;
+  user.lastName = lastName || user.lastName;
+  user.phone = phone || user.phone;
+  user.gender = gender || user.gender;
+  user.dob = dob || user.dob;
+  user.pushToken = pushToken || user.pushToken;
+  user.isSuspended = isSuspended !== undefined ? isSuspended : user.isSuspended;
+  user.isDeleted = isDeleted !== undefined ? isDeleted : user.isDeleted;
+  user.deleteReason = isDeleted ? deleteReason : user.deleteReason;
+  user.avatar = avatar || user.avatar;
+  user.receiveNotifications =
+    receiveNotifications !== undefined
+      ? receiveNotifications
+      : user.receiveNotifications;
+  user.twoFA = twoFA !== undefined ? twoFA : user.twoFA;
 
-      // Update allowed fields
-      if (firstName) user.firstName = firstName;
-      if (lastName) user.lastName = lastName;
-      if (phone) user.phone = phone;
-      if (gender) user.gender = gender;
-      if (dob) user.dob = dob;
-      if (email && email !== user.email) {
-        const emailExists = await User.findOne({ email });
-        if (emailExists) {
-          if (emailExists.isDeleted) {
-            await User.deleteOne({ _id: emailExists._id });
-          } else {
-            return res.status(400).json({
-              status: "error",
-              message: "Email already exists",
-              data: null,
-            });
-          }
-        }
-        user.email = email;
-      }
-      if (receiveNotifications !== undefined)
-        user.receiveNotifications = receiveNotifications;
-      if (twoFA !== undefined) user.twoFA = twoFA;
-      if (avatar) user.avatar = avatar;
-      if (isSuspended !== undefined) user.isSuspended = isSuspended;
-      if (isDeleted !== undefined) {
-        user.isDeleted = isDeleted;
-        if (isDeleted && deleteReason) user.deleteReason = deleteReason;
-      }
+  await user.save();
+  res.json({
+    success: true,
+    message: "Account updated successfully",
+    data: null,
+  });
+});
 
-      await user.save();
+// Logout from All Devices
+router.post("/logout-all-devices", verifyUser, async (req, res) => {
+  const { id: userId } = req.user;
 
-      // Destroy session if user is deleted
-      if (isDeleted) {
-        req.session.destroy((err) => {
-          if (err) {
-            return res.status(500).json({
-              status: "error",
-              message: "Failed to destroy session",
-              data: { error: err.message },
-            });
-          }
-        });
-      }
-
-      res.status(200).json({
-        status: "success",
-        message: "Profile updated successfully",
-        data: null,
-      });
-    } catch (err) {
-      res.status(500).json({
-        status: "error",
-        message: "Server error",
-        data: { error: err.message },
-      });
-    }
-  }
-);
-
-// Auto-login
-router.get("/autologin", verifyUser, async (req, res) => {
   try {
-    const user = await User.findById(req.session.userId).select(
-      "-password -deleteReason"
-    );
-    if (!user || user.isSuspended || user.isDeleted) {
-      return res.status(401).json({
-        status: "error",
-        message: "Unauthorized, suspended, or deleted",
-        data: null,
-      });
+    const sessions = await redisClient.sMembers(`activeSessions:${userId}`);
+    if (sessions.length > 0) {
+      await redisClient.del(sessions); // Delete all session keys
+      await redisClient.del(`activeSessions:${userId}`); // Delete the set
     }
-    res
-      .status(200)
-      .json({ status: "success", message: "Autologin successful", data: user });
-  } catch (err) {
-    res.status(500).json({
-      status: "error",
-      message: "Server error",
-      data: { error: err.message },
+
+    res.json({
+      success: true,
+      message: "Logged out from all devices",
+      data: null,
     });
+  } catch (error) {
+    console.error("Error logging out from all devices:", error);
+    res
+      .status(500)
+      .json({ success: false, message: "Internal server error", data: null });
   }
+});
+
+// Logout Single Session
+router.post("/logout", verifyUser, async (req, res) => {
+  const { session } = req.user;
+
+  try {
+    await redisClient.del(session);
+    await redisClient.sRem(`activeSessions:${req.user.id}`, session);
+    res.json({
+      success: true,
+      message: "Logged out from current session",
+      data: null,
+    });
+  } catch (error) {
+    console.error("Error logging out:", error);
+    res
+      .status(500)
+      .json({ success: false, message: "Internal server error", data: null });
+  }
+});
+
+router.post("/get-user-data", async (req, res) => {
+  const { email } = req.body;
+  if (!email)
+    return res
+      .status(400)
+      .json({ success: false, message: "Email is required", data: null });
+
+  const user = await User.findOne({
+    email,
+    isDeleted: false,
+    isSuspended: false,
+  }).select("-password");
+  if (!user)
+    return res.status(404).json({
+      success: false,
+      message: "User not found or inactive",
+      data: null,
+    });
+
+  const session = `user:${user._id}:${Date.now()}`;
+  const token = jwt.sign({ id: user._id, type: "user", session }, JWT_SECRET, {
+    expiresIn: SESSION_DURATION,
+  });
+  await redisClient.setEx(
+    session,
+    24 * 60 * 60,
+    JSON.stringify({ id: user._id, type: "user" })
+  );
+  await redisClient.sAdd(`activeSessions:${user._id}`, session);
+
+  res.json({
+    success: true,
+    message: "User data retrieved",
+    data: { user },
+    token,
+  });
+});
+
+router.get("/check-user", verifyUser, async (req, res) => {
+  const user = await User.findById(req.user.id).select("-password");
+  if (!user) {
+    return res
+      .status(404)
+      .json({ success: false, message: "User not found", data: null });
+  }
+
+  res.json({
+    success: true,
+    message: "User exists",
+    data: { user },
+    token: req.headers["authorization"].split(" ")[1],
+  });
 });
 
 module.exports = router;
