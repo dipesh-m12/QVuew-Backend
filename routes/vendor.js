@@ -101,6 +101,22 @@ router.post(
       .optional()
       .isString()
       .withMessage("Helper joint business must be a string (Vendor _id)"),
+    body("location")
+      .optional()
+      .custom((value) => {
+        if (value && typeof value !== "object")
+          throw new Error("Location must be an object");
+        if (value && (!("latitude" in value) || !("longitude" in value)))
+          throw new Error("Location must include latitude and longitude");
+        if (
+          value &&
+          (typeof value.latitude !== "number" ||
+            typeof value.longitude !== "number")
+        )
+          throw new Error("Latitude and longitude must be numbers");
+        return true;
+      })
+      .withMessage("Invalid location format"),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -122,6 +138,7 @@ router.post(
       workingHours,
       receiveNotification,
       pushToken,
+      location,
       inactivityReminder, // Added to destructuring
       helperJointBusiness, // Added to destructuring
     } = req.body;
@@ -157,6 +174,7 @@ router.post(
       inactivityReminder, // Added to vendor object
       helperJointBusiness, // Added to vendor object
       joiningCode, // Add the unique joining code
+      location, // Added to vendor object
     });
     await vendor.save();
 
@@ -447,6 +465,7 @@ router.put("/update", verifyUser, async (req, res) => {
     helperJointBusiness,
     connectedHelpers,
     pushToken,
+    location,
   } = req.body;
 
   const vendor = await Vendor.findById(req.user.id);
@@ -482,7 +501,7 @@ router.put("/update", verifyUser, async (req, res) => {
     helperJointBusiness || vendor.helperJointBusiness;
   vendor.connectedHelpers = connectedHelpers || vendor.connectedHelpers;
   vendor.pushToken = pushToken || vendor.pushToken;
-
+  vendor.location = location || vendor.location;
   await vendor.save();
   res.json({
     success: true,
@@ -491,7 +510,7 @@ router.put("/update", verifyUser, async (req, res) => {
   });
 });
 
-// Check Admin
+// Get account details even if deleted or suspended
 router.get("/check-admin", verifyUser, async (req, res) => {
   const vendor = await Vendor.findById(req.user.id).select("-password");
   if (!vendor) {

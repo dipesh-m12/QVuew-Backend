@@ -20,8 +20,15 @@ mongoose
 
 // Routes
 app.use("/api/users", require("./routes/user"));
+
 app.use("/api/service", require("./routes/service"));
+
 app.use("/api/vendor", require("./routes/vendor"));
+app.use("/api/ratecard", require("./routes/rateCards"));
+app.use("/api/helper-connection", require("./routes/helperConnection"));
+app.use("/api/payment", require("./routes/paymentRoutes"));
+//pending
+app.use("/api/queue", require("./routes/queue"));
 
 // Start server
 const PORT = process.env.PORT || 5000;

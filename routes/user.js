@@ -227,6 +227,7 @@ router.post("/logout", verifyUser, async (req, res) => {
   }
 });
 
+//google
 router.post("/get-user-data", async (req, res) => {
   const { email } = req.body;
   if (!email)
@@ -265,6 +266,7 @@ router.post("/get-user-data", async (req, res) => {
   });
 });
 
+//get user data evein if deleted or suspended
 router.get("/check-user", verifyUser, async (req, res) => {
   const user = await User.findById(req.user.id).select("-password");
   if (!user) {

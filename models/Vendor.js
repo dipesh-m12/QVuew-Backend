@@ -1,5 +1,6 @@
 const mongoose = require("mongoose");
 const { v4: uuidv4 } = require("uuid");
+const RateCard = require("./RateCard");
 
 const phoneSchema = new mongoose.Schema({
   dialCode: { type: String, required: true },
@@ -7,13 +8,55 @@ const phoneSchema = new mongoose.Schema({
 });
 
 const workingHoursSchema = new mongoose.Schema({
-  sun: { openTime: String, closeTime: String, isClosed: Boolean },
-  mon: { openTime: String, closeTime: String, isClosed: Boolean },
-  tue: { openTime: String, closeTime: String, isClosed: Boolean },
-  wed: { openTime: String, closeTime: String, isClosed: Boolean },
-  thu: { openTime: String, closeTime: String, isClosed: Boolean },
-  fri: { openTime: String, closeTime: String, isClosed: Boolean },
-  sat: { openTime: String, closeTime: String, isClosed: Boolean },
+  sun: {
+    openTime: { type: String, default: "09:00" },
+    closeTime: { type: String, default: "17:00" },
+    isClosed: { type: Boolean, default: true },
+  },
+  mon: {
+    openTime: { type: String, default: "09:00" },
+    closeTime: { type: String, default: "17:00" },
+    isClosed: { type: Boolean, default: false },
+  },
+  tue: {
+    openTime: { type: String, default: "09:00" },
+    closeTime: { type: String, default: "17:00" },
+    isClosed: { type: Boolean, default: false },
+  },
+  wed: {
+    openTime: { type: String, default: "09:00" },
+    closeTime: { type: String, default: "17:00" },
+    isClosed: { type: Boolean, default: false },
+  },
+  thu: {
+    openTime: { type: String, default: "09:00" },
+    closeTime: { type: String, default: "17:00" },
+    isClosed: { type: Boolean, default: false },
+  },
+  fri: {
+    openTime: { type: String, default: "09:00" },
+    closeTime: { type: String, default: "17:00" },
+    isClosed: { type: Boolean, default: false },
+  },
+  sat: {
+    openTime: { type: String, default: "09:00" },
+    closeTime: { type: String, default: "17:00" },
+    isClosed: { type: Boolean, default: true },
+  },
+});
+
+const connectedHelperSchema = new mongoose.Schema({
+  _id: { type: String, default: uuidv4 },
+  helperId: { type: String, ref: "Vendor", required: true },
+  active: { type: Boolean, default: false },
+  joiningAcceptedDate: { type: Date },
+  requestJoiningDate: { type: Date, default: Date.now },
+  status: {
+    type: String,
+    enum: ["pending", "accepted", "rejected", "removed"],
+    default: "pending",
+  },
+  associatedServices: [{ type: String, ref: "RateCard", default: [] }],
 });
 
 const vendorSchema = new mongoose.Schema(
@@ -37,18 +80,22 @@ const vendorSchema = new mongoose.Schema(
     isDeleted: { type: Boolean, default: false },
     isSuspended: { type: Boolean, default: false },
     receiveNotification: { type: Boolean, default: true },
-    workingHours: { type: workingHoursSchema },
+    workingHours: { type: workingHoursSchema, default: () => ({}) },
     twoFA: { type: Boolean, default: false },
     privacyMode: { type: Boolean, default: false },
     inactivityReminder: {
-      time: Number, // in minutes
-      status: Boolean,
+      time: { type: Number, default: 0 }, // in minutes
+      status: { type: Boolean, default: false },
     },
     active: { type: Boolean, default: false },
-    joiningCode: { type: String, unique: true }, // Add unique index for joiningCode
+    joiningCode: { type: String, unique: true, required: true },
     helperJointBusiness: { type: String, ref: "Vendor" },
-    connectedHelpers: [{ type: String, ref: "Vendor" }], // refs to other helpers' UUIDs
+    connectedHelpers: [connectedHelperSchema], // Updated to array of objects
     pushToken: { type: String },
+    location: {
+      latitude: { type: Number },
+      longitude: { type: Number },
+    },
   },
   { timestamps: true }
 );

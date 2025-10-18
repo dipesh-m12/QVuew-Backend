@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Payment Page</title>
+    <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+  </head>
+  <body>
+    <h1>Payment for Qveuw Premium</h1>
+    <div id="paymentStatus"></div>
+    <button id="payMonthly" disabled>Pay Monthly (₹840)</button>
+    <button id="payYearly" disabled>Pay Yearly (₹7550)</button>
+    <div id="plansSection">
+      <h2>Your Plans</h2>
+      <div id="plansList"></div>
+    </div>
+
+    <script>
+      const TOKEN =
+        "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6ImIzYjhmMDZhLWZhZWEtNDk2Yy05Njg1LWM3MjAwYWU0MzNkYyIsInR5cGUiOiJ2ZW5kb3IiLCJzZXNzaW9uIjoidmVuZG9yOmIzYjhmMDZhLWZhZWEtNDk2Yy05Njg1LWM3MjAwYWU0MzNkYzoxNzYwNzc0NTE2Njk0IiwiaWF0IjoxNzYwNzc0NTE2LCJleHAiOjE3NjA4NjA5MTZ9.AitaOiAZEjRy1pNTCXQDd7x2dWaF9esW5Kfj3w8K8TA";
+      const HOST = "http://localhost:5000";
+      let razorpayOrderId = null;
+
+      // Fetch and display plans
+      async function fetchPlans() {
+        try {
+          const response = await fetch(
+            `${HOST}/api/payment/vendor-plans?allPlans=true`,
+            {
+              headers: { Authorization: TOKEN },
+            }
+          );
+          const result = await response.json();
+          if (result.success) {
+            const plansList = document.getElementById("plansList");
+            plansList.innerHTML = result.data
+              .map(
+                (plan) =>
+                  `<p>Plan: ${plan.planType}, Amount: ₹${
+                    plan.amount
+                  }, Status: ${plan.status}, Active: ${
+                    plan.isActive ? "Yes" : "No"
+                  }, Period: ${plan.startDate} to ${plan.endDate}</p>`
+              )
+              .join("");
+            // Check for active plan and enable/disable buttons
+            const activePlan = result.data.find((plan) => plan.isActive);
+            document.getElementById("payMonthly").disabled = !!activePlan;
+            document.getElementById("payYearly").disabled = !!activePlan;
+            if (activePlan) {
+              document.getElementById("paymentStatus").innerText =
+                "You have an active plan. New payments are disabled.";
+            }
+          } else {
+            document.getElementById("plansList").innerHTML =
+              "<p>No plans found</p>";
+            document.getElementById("payMonthly").disabled = false;
+            document.getElementById("payYearly").disabled = false;
+          }
+        } catch (error) {
+          console.error("Error fetching plans:", error);
+          document.getElementById("plansList").innerHTML =
+            "<p>Failed to load plans</p>";
+          document.getElementById("payMonthly").disabled = false;
+          document.getElementById("payYearly").disabled = false;
+        }
+      }
+
+      // Create Order
+      async function createOrder(planType) {
+        try {
+          const response = await fetch(`${HOST}/api/payment/create-order`, {
+            method: "POST",
+            headers: {
+              Authorization: TOKEN,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ planType }),
+          });
+          const result = await response.json();
+          if (result.success) {
+            razorpayOrderId = result.data.orderId;
+            initiatePayment(result.data);
+          } else {
+            document.getElementById("paymentStatus").innerText = result.message;
+          }
+        } catch (error) {
+          console.error("Error creating order:", error);
+          document.getElementById("paymentStatus").innerText =
+            "Failed to create order";
+        }
+      }
+
+      // Initiate Razorpay Payment
+      function initiatePayment(data) {
+        const options = {
+          key: data.key,
+          amount: data.amount * 100, // Convert to paise
+          currency: data.currency,
+          name: data.name,
+          order_id: razorpayOrderId,
+          handler: async function (response) {
+            try {
+              const verifyResponse = await fetch(
+                `${HOST}/api/payment/verify-payment`,
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    razorpay_order_id: response.razorpay_order_id,
+                    razorpay_payment_id: response.razorpay_payment_id,
+                    razorpay_signature: response.razorpay_signature,
+                  }),
+                }
+              );
+              const result = await verifyResponse.json();
+              document.getElementById("paymentStatus").innerText =
+                result.message;
+              if (result.success) {
+                fetchPlans(); // Refresh plans after successful payment
+              }
+            } catch (error) {
+              console.error("Error verifying payment:", error);
+              document.getElementById("paymentStatus").innerText =
+                "Payment verification failed";
+            }
+          },
+          prefill: {
+            name: "Vendor Name",
+            email: "vendor@example.com",
+            contact: "9876543210",
+          },
+          theme: {
+            color: "#3399cc",
+          },
+        };
+        const rzp = new Razorpay(options);
+        rzp.open();
+      }
+
+      // Event Listeners
+      document
+        .getElementById("payMonthly")
+        .addEventListener("click", () => createOrder("monthly"));
+      document
+        .getElementById("payYearly")
+        .addEventListener("click", () => createOrder("yearly"));
+
+      // Load plans on page load
+      window.onload = fetchPlans;
+    </script>
+  </body>
+</html>

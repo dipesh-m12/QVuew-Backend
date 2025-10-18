@@ -9,6 +9,12 @@ const supportRequestSchema = new mongoose.Schema({
   createdBy: { type: String, required: true }, // User ID
   accountType: { type: String, enum: ["vendor", "user"], required: true },
   createdAt: { type: Date, default: Date.now },
+  status: {
+    type: String,
+    enum: ["open", "in_progress", "closed"],
+    default: "open",
+  },
+  attachments: [{ type: String }], // Array of file URLs or paths
 });
 
 // Indexes for common query fields
