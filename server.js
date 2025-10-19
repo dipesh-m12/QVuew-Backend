@@ -27,6 +27,10 @@ app.use("/api/vendor", require("./routes/vendor"));
 app.use("/api/ratecard", require("./routes/rateCards"));
 app.use("/api/helper-connection", require("./routes/helperConnection"));
 app.use("/api/payment", require("./routes/paymentRoutes"));
+app.use("/api/sms", require("./routes/sms"));
+app.use("/api/ocr", require("./routes/ocr"));
+app.use("/api/gemini", require("./routes/gemini"));
+app.use("/api/upload", require("./routes/upload"));
 //pending
 app.use("/api/queue", require("./routes/queue"));
 
