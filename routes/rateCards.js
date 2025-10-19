@@ -85,11 +85,14 @@ router.get("/rate-cards", async (req, res) => {
       const ids = Array.isArray(serviceIds)
         ? serviceIds
         : serviceIds.split(",");
-      rateCards = await RateCard.find({ _id: { $in: ids } });
+      rateCards = await RateCard.find({ _id: { $in: ids }, isDeleted: false });
     } else if (vendorId) {
-      rateCards = await RateCard.find({ createdBy: vendorId });
+      rateCards = await RateCard.find({
+        createdBy: vendorId,
+        isDeleted: false,
+      });
     } else {
-      rateCards = await RateCard.find();
+      rateCards = await RateCard.find({ isDeleted: false });
     }
 
     res.json({
@@ -204,17 +207,18 @@ router.delete("/rate-cards/:id", verifyUser, async (req, res) => {
       });
     }
 
-    await RateCard.deleteOne({ _id: id });
+    rateCard.isDeleted = true;
+    await rateCard.save();
     res.json({
       success: true,
-      message: "Rate card deleted successfully",
+      message: "Rate card marked as deleted successfully",
       data: null,
     });
   } catch (error) {
-    console.error("Error deleting rate card:", error);
+    console.error("Error marking rate card as deleted:", error);
     res.status(500).json({
       success: false,
-      message: "Failed to delete rate card",
+      message: "Failed to mark rate card as deleted",
       data: null,
     });
   }

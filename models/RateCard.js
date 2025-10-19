@@ -18,6 +18,7 @@ const rateCardSchema = new mongoose.Schema(
     duration: { type: Number, required: true }, // in minutes
     rate: { type: Number, required: true },
     createdBy: { type: String, ref: "Vendor", required: true },
+    isDeleted: { type: Boolean, default: false },
   },
   { timestamps: true }
 );
