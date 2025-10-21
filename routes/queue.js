@@ -313,396 +313,6 @@ router.post(
   }
 );
 
-// Restructure Queue for Time Range - FCFS Balanced Distribution
-router.post(
-  "/restructure-queue",
-  verifyUser,
-  [
-    body("vendorId").isString().withMessage("Valid vendor ID is required"),
-    body("startTime").isISO8601().withMessage("Valid start time is required"),
-    body("endTime").isISO8601().withMessage("Valid end time is required"),
-  ],
-  async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res
-        .status(400)
-        .json({ success: false, message: errors.array()[0].msg, data: null });
-    }
-
-    const { vendorId, startTime, endTime } = req.body;
-
-    const session = await Queue.startSession();
-    session.startTransaction();
-
-    try {
-      // Verify vendor
-      const vendor = await Vendor.findOne({
-        _id: vendorId,
-        accountType: "owner",
-        isDeleted: false,
-        isSuspended: false,
-      }).session(session);
-
-      if (!vendor) {
-        throw new Error("Vendor is not an active owner or not found");
-      }
-
-      // Check if business is active
-      if (!vendor.active) {
-        await session.commitTransaction();
-        return res.status(400).json({
-          success: false,
-          message: "Business is currently inactive",
-          data: null,
-        });
-      }
-
-      // Get all active helpers
-      const activeHelpers = vendor.connectedHelpers.filter(
-        (ch) => ch.status === "accepted" && ch.active
-      );
-
-      if (activeHelpers.length === 0) {
-        await session.commitTransaction();
-        return res.status(400).json({
-          success: false,
-          message: "No active helpers available",
-          data: null,
-        });
-      }
-
-      // Get all queue entries within time range
-      const allQueues = await Queue.find({
-        vendorId,
-        status: { $in: ["in_queue", "hold"] }, // Only active queues
-        createdAt: { $gte: new Date(startTime), $lte: new Date(endTime) },
-      })
-        .populate("serviceId", "name duration rate")
-        .sort({ joiningTime: 1 })
-        .session(session);
-
-      if (allQueues.length === 0) {
-        await session.commitTransaction();
-        return res.json({
-          success: true,
-          message: "No queues to restructure",
-          data: null,
-        });
-      }
-
-      // Group queues by serviceId
-      const queuesByService = {};
-      allQueues.forEach((queue) => {
-        const serviceId = queue.serviceId._id.toString();
-        if (!queuesByService[serviceId]) {
-          queuesByService[serviceId] = [];
-        }
-        queuesByService[serviceId].push(queue);
-      });
-
-      const notifications = [];
-      let updatedCount = 0;
-
-      // Process each service group
-      for (const serviceId in queuesByService) {
-        const serviceQueues = queuesByService[serviceId];
-        const service = serviceQueues[0].serviceId;
-
-        // Find capable helpers
-        const capableHelpers = activeHelpers.filter((h) =>
-          h.associatedServices.includes(serviceId)
-        );
-
-        if (capableHelpers.length === 0) {
-          console.log(`No active helpers for service ${serviceId}`);
-          continue;
-        }
-
-        // Initialize helper assignments
-        const helperAssignments = {};
-        capableHelpers.forEach((helper) => {
-          helperAssignments[helper.helperId] = {
-            inQueue: [],
-            hold: [],
-          };
-        });
-
-        // Separate queues by status
-        const inQueueList = [];
-        const holdList = [];
-
-        for (const queue of serviceQueues) {
-          if (queue.status === "hold") {
-            holdList.push(queue);
-          } else {
-            // in_queue (includes skipped - they're treated as normal in_queue)
-            inQueueList.push(queue);
-          }
-        }
-
-        // Assign in_queue people first (FCFS, load balanced)
-        inQueueList.sort((a, b) => a.joiningTime - b.joiningTime);
-
-        for (const queue of inQueueList) {
-          // Check if helper preference is valid
-          if (queue.preference === "SPECIFIC") {
-            const isHelperActive = capableHelpers.some(
-              (h) => h.helperId === queue.helperId
-            );
-            if (isHelperActive) {
-              helperAssignments[queue.helperId].inQueue.push(queue);
-            } else {
-              // Reassign to least loaded helper
-              const sortedHelpers = capableHelpers.sort(
-                (a, b) =>
-                  helperAssignments[a.helperId].inQueue.length -
-                  helperAssignments[b.helperId].inQueue.length
-              );
-              helperAssignments[sortedHelpers[0].helperId].inQueue.push(queue);
-            }
-          } else {
-            // ANY preference - assign to least loaded helper
-            const sortedHelpers = capableHelpers.sort(
-              (a, b) =>
-                helperAssignments[a.helperId].inQueue.length -
-                helperAssignments[b.helperId].inQueue.length
-            );
-            helperAssignments[sortedHelpers[0].helperId].inQueue.push(queue);
-          }
-        }
-
-        // Assign hold people to their current helper (they block their position)
-        for (const queue of holdList) {
-          const isHelperActive = capableHelpers.some(
-            (h) => h.helperId === queue.helperId
-          );
-          if (isHelperActive) {
-            helperAssignments[queue.helperId].hold.push(queue);
-          } else {
-            // Reassign to first available helper
-            helperAssignments[capableHelpers[0].helperId].hold.push(queue);
-          }
-        }
-
-        // Update positions and times for all queues
-        for (const helperId in helperAssignments) {
-          const assignment = helperAssignments[helperId];
-          let currentPosition = 1;
-
-          // Process in_queue people first - they take available positions
-          for (const queue of assignment.inQueue) {
-            const oldPosition = queue.currentPosition;
-            const oldHelperId = queue.helperId;
-            const oldEstimatedWait = queue.estimatedWait;
-
-            // Skip positions blocked by hold people
-            while (
-              assignment.hold.some((h) => h.currentPosition === currentPosition)
-            ) {
-              currentPosition++;
-            }
-
-            const newPosition = currentPosition++;
-            const newEstimatedWait = (newPosition - 1) * service.duration;
-            const newEstimatedServiceStartTime = new Date(
-              Date.now() + newEstimatedWait * 60 * 1000
-            );
-
-            // Check for changes
-            const hasChanges =
-              queue.currentPosition !== newPosition ||
-              queue.helperId !== helperId ||
-              Math.abs(queue.estimatedWait - newEstimatedWait) >= 1;
-
-            if (hasChanges) {
-              const queueDoc = await Queue.findOne({
-                _id: queue._id,
-              }).session(session);
-
-              queueDoc.helperId = helperId;
-              queueDoc.currentPosition = newPosition;
-              queueDoc.estimatedWait = newEstimatedWait;
-              queueDoc.estimatedServiceStartTime = newEstimatedServiceStartTime;
-
-              queueDoc.updateHistory.push({
-                action: "edit",
-                source: "vendor",
-                timestamp: new Date(),
-                previousPosition: oldPosition,
-                newPosition,
-                estimatedWait: newEstimatedWait,
-                serviceId,
-                businessId: vendorId,
-                newlyAssignedHelperId:
-                  helperId !== oldHelperId ? helperId : undefined,
-              });
-
-              await queueDoc.save({ session });
-              updatedCount++;
-
-              // Track notification for normal users
-              if (queue.userType === "normal" && queue.userId) {
-                const positionChanged = oldPosition !== newPosition;
-                const helperChanged = helperId !== oldHelperId;
-                const waitTimeChanged =
-                  Math.abs(oldEstimatedWait - newEstimatedWait) >= 5;
-
-                if (positionChanged || helperChanged || waitTimeChanged) {
-                  notifications.push({
-                    userId: queue.userId,
-                    oldPosition,
-                    newPosition,
-                    estimatedWait: newEstimatedWait,
-                    status: queue.status,
-                    helperChanged,
-                  });
-                }
-              }
-            }
-          }
-
-          // Process hold people - they stay at their current position
-          for (const queue of assignment.hold) {
-            const oldHelperId = queue.helperId;
-            const oldEstimatedWait = queue.estimatedWait;
-
-            // Hold people keep their position but may get new helper
-            const newEstimatedWait =
-              (queue.currentPosition - 1) * service.duration;
-            const newEstimatedServiceStartTime = new Date(
-              Date.now() + newEstimatedWait * 60 * 1000
-            );
-
-            const hasChanges =
-              queue.helperId !== helperId ||
-              Math.abs(queue.estimatedWait - newEstimatedWait) >= 1;
-
-            if (hasChanges) {
-              const queueDoc = await Queue.findOne({
-                _id: queue._id,
-              }).session(session);
-
-              queueDoc.helperId = helperId;
-              queueDoc.estimatedWait = newEstimatedWait;
-              queueDoc.estimatedServiceStartTime = newEstimatedServiceStartTime;
-
-              queueDoc.updateHistory.push({
-                action: "edit",
-                source: "vendor",
-                timestamp: new Date(),
-                previousPosition: queue.currentPosition,
-                newPosition: queue.currentPosition,
-                estimatedWait: newEstimatedWait,
-                serviceId,
-                businessId: vendorId,
-                newlyAssignedHelperId:
-                  helperId !== oldHelperId ? helperId : undefined,
-              });
-
-              await queueDoc.save({ session });
-              updatedCount++;
-
-              // Track notification for normal users
-              if (queue.userType === "normal" && queue.userId) {
-                const helperChanged = helperId !== oldHelperId;
-                const waitTimeChanged =
-                  Math.abs(oldEstimatedWait - newEstimatedWait) >= 5;
-
-                if (helperChanged || waitTimeChanged) {
-                  notifications.push({
-                    userId: queue.userId,
-                    oldPosition: queue.currentPosition,
-                    newPosition: queue.currentPosition,
-                    estimatedWait: newEstimatedWait,
-                    status: queue.status,
-                    helperChanged,
-                  });
-                }
-              }
-            }
-          }
-        }
-      }
-
-      await session.commitTransaction();
-
-      // Send notifications after successful commit
-      for (const notification of notifications) {
-        try {
-          const user = await User.findOne({
-            _id: notification.userId,
-          }).select("pushToken receiveNotifications");
-
-          if (user?.receiveNotifications && user.pushToken) {
-            let message;
-            if (notification.status === "hold") {
-              message = notification.helperChanged
-                ? `Queue updated! You're on HOLD at position ${notification.newPosition}. Helper reassigned. ETA: ${notification.estimatedWait} mins`
-                : `Queue updated! You're on HOLD at position ${notification.newPosition}. ETA: ${notification.estimatedWait} mins`;
-            } else {
-              message = notification.helperChanged
-                ? `Queue updated! Position: ${notification.oldPosition} → ${notification.newPosition}. Helper reassigned. ETA: ${notification.estimatedWait} mins`
-                : `Queue updated! Position: ${notification.oldPosition} → ${notification.newPosition}. ETA: ${notification.estimatedWait} mins`;
-            }
-
-            await axios.post(
-              "https://exp.host/--/api/v2/push/send",
-              [
-                {
-                  to: user.pushToken,
-                  sound: "default",
-                  title: "Queue Updated",
-                  body: message,
-                  data: {
-                    type: "queue_updated",
-                    newPosition: notification.newPosition,
-                    estimatedWait: notification.estimatedWait,
-                    helperChanged: notification.helperChanged,
-                    status: notification.status,
-                  },
-                },
-              ],
-              {
-                headers: {
-                  "Content-Type": "application/json",
-                  Accept: "application/json",
-                },
-              }
-            );
-          }
-        } catch (notifyError) {
-          console.error(
-            `Notification failed for user ${notification.userId}:`,
-            notifyError
-          );
-        }
-      }
-
-      res.json({
-        success: true,
-        message: `Queue restructured successfully. ${updatedCount} entries updated.`,
-        data: {
-          updatedCount,
-          notificationsSent: notifications.length,
-          activeHelpers: activeHelpers.length,
-          totalQueues: allQueues.length,
-        },
-      });
-    } catch (error) {
-      await session.abortTransaction();
-      console.error("Error restructuring queue:", error);
-      res.status(500).json({
-        success: false,
-        message: error.message || "Failed to restructure queue",
-        data: null,
-      });
-    } finally {
-      session.endSession();
-    }
-  }
-);
-
 // Get Helper's Queue with Time Range
 router.post(
   "/helper-queue",
@@ -1146,7 +756,6 @@ router.post(
     }
   }
 );
-// ------------------------------------------------------------------------------
 
 // Update Rating and Comments
 router.post(
@@ -1729,6 +1338,399 @@ router.post(
   }
 );
 
+// ------------------------------------------------------------------------------
+
+// Restructure Queue for Time Range - FCFS Balanced Distribution
+router.post(
+  "/restructure-queue",
+  verifyUser,
+  [
+    body("vendorId").isString().withMessage("Valid vendor ID is required"),
+    body("startTime").isISO8601().withMessage("Valid start time is required"),
+    body("endTime").isISO8601().withMessage("Valid end time is required"),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res
+        .status(400)
+        .json({ success: false, message: errors.array()[0].msg, data: null });
+    }
+
+    const { vendorId, startTime, endTime } = req.body;
+
+    const session = await Queue.startSession();
+    session.startTransaction();
+
+    try {
+      // Verify vendor
+      const vendor = await Vendor.findOne({
+        _id: vendorId,
+        accountType: "owner",
+        isDeleted: false,
+        isSuspended: false,
+      }).session(session);
+
+      if (!vendor) {
+        throw new Error("Vendor is not an active owner or not found");
+      }
+
+      // Check if business is active
+      if (!vendor.active) {
+        await session.commitTransaction();
+        return res.status(400).json({
+          success: false,
+          message: "Business is currently inactive",
+          data: null,
+        });
+      }
+
+      // Get all active helpers
+      const activeHelpers = vendor.connectedHelpers.filter(
+        (ch) => ch.status === "accepted" && ch.active
+      );
+
+      if (activeHelpers.length === 0) {
+        await session.commitTransaction();
+        return res.status(400).json({
+          success: false,
+          message: "No active helpers available",
+          data: null,
+        });
+      }
+
+      // Get all queue entries within time range
+      const allQueues = await Queue.find({
+        vendorId,
+        status: { $in: ["in_queue", "hold"] }, // Only active queues
+        createdAt: { $gte: new Date(startTime), $lte: new Date(endTime) },
+      })
+        .populate("serviceId", "name duration rate")
+        .sort({ joiningTime: 1 })
+        .session(session);
+
+      if (allQueues.length === 0) {
+        await session.commitTransaction();
+        return res.json({
+          success: true,
+          message: "No queues to restructure",
+          data: null,
+        });
+      }
+
+      // Group queues by serviceId
+      const queuesByService = {};
+      allQueues.forEach((queue) => {
+        const serviceId = queue.serviceId._id.toString();
+        if (!queuesByService[serviceId]) {
+          queuesByService[serviceId] = [];
+        }
+        queuesByService[serviceId].push(queue);
+      });
+
+      const notifications = [];
+      let updatedCount = 0;
+
+      // Process each service group
+      for (const serviceId in queuesByService) {
+        const serviceQueues = queuesByService[serviceId];
+        const service = serviceQueues[0].serviceId;
+
+        // Find capable helpers
+        const capableHelpers = activeHelpers.filter((h) =>
+          h.associatedServices.includes(serviceId)
+        );
+
+        if (capableHelpers.length === 0) {
+          console.log(`No active helpers for service ${serviceId}`);
+          continue;
+        }
+
+        // Initialize helper assignments
+        const helperAssignments = {};
+        capableHelpers.forEach((helper) => {
+          helperAssignments[helper.helperId] = {
+            inQueue: [],
+            hold: [],
+          };
+        });
+
+        // Separate queues by status
+        const inQueueList = [];
+        const holdList = [];
+
+        for (const queue of serviceQueues) {
+          if (queue.status === "hold") {
+            holdList.push(queue);
+          } else {
+            // in_queue (includes skipped - they're treated as normal in_queue)
+            inQueueList.push(queue);
+          }
+        }
+
+        // Assign in_queue people first (FCFS, load balanced)
+        inQueueList.sort((a, b) => a.joiningTime - b.joiningTime);
+
+        for (const queue of inQueueList) {
+          // Check if helper preference is valid
+          if (queue.preference === "SPECIFIC") {
+            const isHelperActive = capableHelpers.some(
+              (h) => h.helperId === queue.helperId
+            );
+            if (isHelperActive) {
+              helperAssignments[queue.helperId].inQueue.push(queue);
+            } else {
+              // Reassign to least loaded helper
+              const sortedHelpers = capableHelpers.sort(
+                (a, b) =>
+                  helperAssignments[a.helperId].inQueue.length -
+                  helperAssignments[b.helperId].inQueue.length
+              );
+              helperAssignments[sortedHelpers[0].helperId].inQueue.push(queue);
+            }
+          } else {
+            // ANY preference - assign to least loaded helper
+            const sortedHelpers = capableHelpers.sort(
+              (a, b) =>
+                helperAssignments[a.helperId].inQueue.length -
+                helperAssignments[b.helperId].inQueue.length
+            );
+            helperAssignments[sortedHelpers[0].helperId].inQueue.push(queue);
+          }
+        }
+
+        // Assign hold people to their current helper (they block their position)
+        for (const queue of holdList) {
+          const isHelperActive = capableHelpers.some(
+            (h) => h.helperId === queue.helperId
+          );
+          if (isHelperActive) {
+            helperAssignments[queue.helperId].hold.push(queue);
+          } else {
+            // Reassign to first available helper
+            helperAssignments[capableHelpers[0].helperId].hold.push(queue);
+          }
+        }
+
+        // Update positions and times for all queues
+        for (const helperId in helperAssignments) {
+          const assignment = helperAssignments[helperId];
+          let currentPosition = 1;
+
+          // Process in_queue people first - they take available positions
+          for (const queue of assignment.inQueue) {
+            const oldPosition = queue.currentPosition;
+            const oldHelperId = queue.helperId;
+            const oldEstimatedWait = queue.estimatedWait;
+
+            // Skip positions blocked by hold people
+            while (
+              assignment.hold.some((h) => h.currentPosition === currentPosition)
+            ) {
+              currentPosition++;
+            }
+
+            const newPosition = currentPosition++;
+            const newEstimatedWait = (newPosition - 1) * service.duration;
+            const newEstimatedServiceStartTime = new Date(
+              Date.now() + newEstimatedWait * 60 * 1000
+            );
+
+            // Check for changes
+            const hasChanges =
+              queue.currentPosition !== newPosition ||
+              queue.helperId !== helperId ||
+              Math.abs(queue.estimatedWait - newEstimatedWait) >= 1;
+
+            if (hasChanges) {
+              const queueDoc = await Queue.findOne({
+                _id: queue._id,
+              }).session(session);
+
+              queueDoc.helperId = helperId;
+              queueDoc.currentPosition = newPosition;
+              queueDoc.estimatedWait = newEstimatedWait;
+              queueDoc.estimatedServiceStartTime = newEstimatedServiceStartTime;
+
+              queueDoc.updateHistory.push({
+                action: "edit",
+                source: "vendor",
+                timestamp: new Date(),
+                previousPosition: oldPosition,
+                newPosition,
+                estimatedWait: newEstimatedWait,
+                serviceId,
+                businessId: vendorId,
+                newlyAssignedHelperId:
+                  helperId !== oldHelperId ? helperId : undefined,
+              });
+
+              await queueDoc.save({ session });
+              updatedCount++;
+
+              // Track notification for normal users
+              if (queue.userType === "normal" && queue.userId) {
+                const positionChanged = oldPosition !== newPosition;
+                const helperChanged = helperId !== oldHelperId;
+                const waitTimeChanged =
+                  Math.abs(oldEstimatedWait - newEstimatedWait) >= 5;
+
+                if (positionChanged || helperChanged || waitTimeChanged) {
+                  notifications.push({
+                    userId: queue.userId,
+                    oldPosition,
+                    newPosition,
+                    estimatedWait: newEstimatedWait,
+                    status: queue.status,
+                    helperChanged,
+                  });
+                }
+              }
+            }
+          }
+
+          // Process hold people - they stay at their current position
+          for (const queue of assignment.hold) {
+            const oldHelperId = queue.helperId;
+            const oldEstimatedWait = queue.estimatedWait;
+
+            // Hold people keep their position but may get new helper
+            const newEstimatedWait =
+              (queue.currentPosition - 1) * service.duration;
+            const newEstimatedServiceStartTime = new Date(
+              Date.now() + newEstimatedWait * 60 * 1000
+            );
+
+            const hasChanges =
+              queue.helperId !== helperId ||
+              Math.abs(queue.estimatedWait - newEstimatedWait) >= 1;
+
+            if (hasChanges) {
+              const queueDoc = await Queue.findOne({
+                _id: queue._id,
+              }).session(session);
+
+              queueDoc.helperId = helperId;
+              queueDoc.estimatedWait = newEstimatedWait;
+              queueDoc.estimatedServiceStartTime = newEstimatedServiceStartTime;
+
+              queueDoc.updateHistory.push({
+                action: "edit",
+                source: "vendor",
+                timestamp: new Date(),
+                previousPosition: queue.currentPosition,
+                newPosition: queue.currentPosition,
+                estimatedWait: newEstimatedWait,
+                serviceId,
+                businessId: vendorId,
+                newlyAssignedHelperId:
+                  helperId !== oldHelperId ? helperId : undefined,
+              });
+
+              await queueDoc.save({ session });
+              updatedCount++;
+
+              // Track notification for normal users
+              if (queue.userType === "normal" && queue.userId) {
+                const helperChanged = helperId !== oldHelperId;
+                const waitTimeChanged =
+                  Math.abs(oldEstimatedWait - newEstimatedWait) >= 5;
+
+                if (helperChanged || waitTimeChanged) {
+                  notifications.push({
+                    userId: queue.userId,
+                    oldPosition: queue.currentPosition,
+                    newPosition: queue.currentPosition,
+                    estimatedWait: newEstimatedWait,
+                    status: queue.status,
+                    helperChanged,
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+
+      await session.commitTransaction();
+
+      // Send notifications after successful commit
+      for (const notification of notifications) {
+        try {
+          const user = await User.findOne({
+            _id: notification.userId,
+          }).select("pushToken receiveNotifications");
+
+          if (user?.receiveNotifications && user.pushToken) {
+            let message;
+            if (notification.status === "hold") {
+              message = notification.helperChanged
+                ? `Queue updated! You're on HOLD at position ${notification.newPosition}. Helper reassigned. ETA: ${notification.estimatedWait} mins`
+                : `Queue updated! You're on HOLD at position ${notification.newPosition}. ETA: ${notification.estimatedWait} mins`;
+            } else {
+              message = notification.helperChanged
+                ? `Queue updated! Position: ${notification.oldPosition} → ${notification.newPosition}. Helper reassigned. ETA: ${notification.estimatedWait} mins`
+                : `Queue updated! Position: ${notification.oldPosition} → ${notification.newPosition}. ETA: ${notification.estimatedWait} mins`;
+            }
+
+            await axios.post(
+              "https://exp.host/--/api/v2/push/send",
+              [
+                {
+                  to: user.pushToken,
+                  sound: "default",
+                  title: "Queue Updated",
+                  body: message,
+                  data: {
+                    type: "queue_updated",
+                    newPosition: notification.newPosition,
+                    estimatedWait: notification.estimatedWait,
+                    helperChanged: notification.helperChanged,
+                    status: notification.status,
+                  },
+                },
+              ],
+              {
+                headers: {
+                  "Content-Type": "application/json",
+                  Accept: "application/json",
+                },
+              }
+            );
+          }
+        } catch (notifyError) {
+          console.error(
+            `Notification failed for user ${notification.userId}:`,
+            notifyError
+          );
+        }
+      }
+
+      res.json({
+        success: true,
+        message: `Queue restructured successfully. ${updatedCount} entries updated.`,
+        data: {
+          updatedCount,
+          notificationsSent: notifications.length,
+          activeHelpers: activeHelpers.length,
+          totalQueues: allQueues.length,
+        },
+      });
+    } catch (error) {
+      await session.abortTransaction();
+      console.error("Error restructuring queue:", error);
+      res.status(500).json({
+        success: false,
+        message: error.message || "Failed to restructure queue",
+        data: null,
+      });
+    } finally {
+      session.endSession();
+    }
+  }
+);
+
+//queue Action (Skip, Hold, Remove, Next, Add Time, Unhold, Undo)
 router.post(
   "/queue-action",
   verifyUser,
@@ -2458,6 +2460,7 @@ router.post(
   }
 );
 
+// Helper Recent Actions Route
 router.post(
   "/helper-recent-actions",
   verifyUser,
@@ -2520,8 +2523,8 @@ router.post(
         status: { $in: ["in_queue", "hold"] },
         "updateHistory.source": "vendor",
         "updateHistory.timestamp": {
-          $gte: new Date(Date.now() - 5 * 60 * 1000),
-        }, // Last 5 minutes
+          $gte: new Date(Date.now() - 30 * 60 * 1000),
+        }, // Last 30 minutes
       })
         .populate("serviceId", "name")
         .populate("userId", "firstName lastName")
@@ -2583,22 +2586,6 @@ router.post(
     }
   }
 );
-
-// Haversine formula to calculate distance between two points (in kilometers)
-const getDistance = (lat1, lon1, lat2, lon2) => {
-  const toRad = (value) => (value * Math.PI) / 180;
-  const R = 6371; // Earth's radius in kilometers
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) *
-      Math.cos(toRad(lat2)) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
-};
 
 //Search and Discovery Route
 router.post(
