@@ -342,11 +342,20 @@ router.post(
         accountType: "owner",
         isDeleted: false,
         isSuspended: false,
-        active: true,
       }).session(session);
 
       if (!vendor) {
         throw new Error("Vendor is not an active owner or not found");
+      }
+
+      // Check if business is active
+      if (!vendor.active) {
+        await session.commitTransaction();
+        return res.status(400).json({
+          success: false,
+          message: "Business is currently inactive",
+          data: null,
+        });
       }
 
       // Get all active helpers
@@ -355,49 +364,10 @@ router.post(
       );
 
       if (activeHelpers.length === 0) {
-        // Notify all users in queue that no helpers are available
-        const queues = await Queue.find({
-          vendorId,
-          status: { $in: ["in_queue", "hold", "skipped"] },
-          createdAt: { $gte: new Date(startTime), $lte: new Date(endTime) },
-        }).session(session);
-
-        const userIds = queues
-          .filter((q) => q.userType === "normal" && q.userId)
-          .map((q) => q.userId);
-
-        if (userIds.length > 0) {
-          const pushTokens = await User.find({
-            _id: { $in: userIds },
-            receiveNotifications: true,
-          }).select("pushToken");
-
-          if (pushTokens.length > 0) {
-            await axios.post(
-              "https://exp.host/--/api/v2/push/send",
-              pushTokens
-                .filter((u) => u.pushToken)
-                .map((token) => ({
-                  to: token.pushToken,
-                  sound: "default",
-                  title: "Queue Paused",
-                  body: "No active helpers available. You will be notified when the queue resumes.",
-                  data: { type: "queue_paused" },
-                })),
-              {
-                headers: {
-                  "Content-Type": "application/json",
-                  Accept: "application/json",
-                },
-              }
-            );
-          }
-        }
-
         await session.commitTransaction();
         return res.status(400).json({
           success: false,
-          message: "No active helpers available to restructure queue",
+          message: "No active helpers available",
           data: null,
         });
       }
@@ -405,11 +375,11 @@ router.post(
       // Get all queue entries within time range
       const allQueues = await Queue.find({
         vendorId,
-        status: { $in: ["in_queue", "hold", "skipped"] },
+        status: { $in: ["in_queue", "hold"] }, // Only active queues
         createdAt: { $gte: new Date(startTime), $lte: new Date(endTime) },
       })
         .populate("serviceId", "name duration rate")
-        .sort({ joiningTime: 1 }) // Sort by joining time (FCFS)
+        .sort({ joiningTime: 1 })
         .session(session);
 
       if (allQueues.length === 0) {
@@ -421,7 +391,7 @@ router.post(
         });
       }
 
-      // Group queues by serviceId for processing
+      // Group queues by serviceId
       const queuesByService = {};
       allQueues.forEach((queue) => {
         const serviceId = queue.serviceId._id.toString();
@@ -437,9 +407,9 @@ router.post(
       // Process each service group
       for (const serviceId in queuesByService) {
         const serviceQueues = queuesByService[serviceId];
-        const service = serviceQueues[0].serviceId; // Service details already populated
+        const service = serviceQueues[0].serviceId;
 
-        // Find helpers who can provide this service
+        // Find capable helpers
         const capableHelpers = activeHelpers.filter((h) =>
           h.associatedServices.includes(serviceId)
         );
@@ -449,119 +419,101 @@ router.post(
           continue;
         }
 
-        // Initialize helper assignment tracking
+        // Initialize helper assignments
         const helperAssignments = {};
         capableHelpers.forEach((helper) => {
-          helperAssignments[helper.helperId] = [];
+          helperAssignments[helper.helperId] = {
+            inQueue: [],
+            hold: [],
+          };
         });
 
-        // Separate queues by status and preference
-        const currentlyServing = []; // Position 1, in_queue
-        const specificPreference = []; // SPECIFIC preference
-        const holdQueues = []; // HOLD status
-        const flexibleQueues = []; // ANY preference, in_queue/skipped
+        // Separate queues by status
+        const inQueueList = [];
+        const holdList = [];
 
         for (const queue of serviceQueues) {
-          // Preserve currently serving customer (position 1, in_queue)
-          if (queue.currentPosition === 1 && queue.status === "in_queue") {
-            currentlyServing.push(queue);
+          if (queue.status === "hold") {
+            holdList.push(queue);
+          } else {
+            // in_queue (includes skipped - they're treated as normal in_queue)
+            inQueueList.push(queue);
           }
-          // Keep SPECIFIC preference with their assigned helper (if helper is active)
-          else if (queue.preference === "SPECIFIC") {
+        }
+
+        // Assign in_queue people first (FCFS, load balanced)
+        inQueueList.sort((a, b) => a.joiningTime - b.joiningTime);
+
+        for (const queue of inQueueList) {
+          // Check if helper preference is valid
+          if (queue.preference === "SPECIFIC") {
             const isHelperActive = capableHelpers.some(
               (h) => h.helperId === queue.helperId
             );
             if (isHelperActive) {
-              specificPreference.push(queue);
+              helperAssignments[queue.helperId].inQueue.push(queue);
             } else {
-              // If assigned helper is inactive, treat as flexible
-              flexibleQueues.push(queue);
+              // Reassign to least loaded helper
+              const sortedHelpers = capableHelpers.sort(
+                (a, b) =>
+                  helperAssignments[a.helperId].inQueue.length -
+                  helperAssignments[b.helperId].inQueue.length
+              );
+              helperAssignments[sortedHelpers[0].helperId].inQueue.push(queue);
             }
-          }
-          // Keep HOLD status as-is
-          else if (queue.status === "hold") {
-            holdQueues.push(queue);
-          }
-          // Flexible queues (ANY preference, in_queue or skipped)
-          else {
-            flexibleQueues.push(queue);
+          } else {
+            // ANY preference - assign to least loaded helper
+            const sortedHelpers = capableHelpers.sort(
+              (a, b) =>
+                helperAssignments[a.helperId].inQueue.length -
+                helperAssignments[b.helperId].inQueue.length
+            );
+            helperAssignments[sortedHelpers[0].helperId].inQueue.push(queue);
           }
         }
 
-        // Assign currently serving customers first
-        for (const queue of currentlyServing) {
+        // Assign hold people to their current helper (they block their position)
+        for (const queue of holdList) {
           const isHelperActive = capableHelpers.some(
             (h) => h.helperId === queue.helperId
           );
-
           if (isHelperActive) {
-            helperAssignments[queue.helperId].push(queue);
+            helperAssignments[queue.helperId].hold.push(queue);
           } else {
             // Reassign to first available helper
-            helperAssignments[capableHelpers[0].helperId].push(queue);
+            helperAssignments[capableHelpers[0].helperId].hold.push(queue);
           }
-        }
-
-        // Assign SPECIFIC preference customers
-        for (const queue of specificPreference) {
-          helperAssignments[queue.helperId].push(queue);
-        }
-
-        // Assign HOLD customers (keep with current helper if active)
-        for (const queue of holdQueues) {
-          const isHelperActive = capableHelpers.some(
-            (h) => h.helperId === queue.helperId
-          );
-          const targetHelperId = isHelperActive
-            ? queue.helperId
-            : capableHelpers[0].helperId;
-          helperAssignments[targetHelperId].push(queue);
-        }
-
-        // Balance flexible queues across helpers using FCFS
-        // Sort by joining time (already sorted from parent query)
-        let helperIndex = 0;
-        for (const queue of flexibleQueues) {
-          // Find helper with smallest queue (round-robin with load balancing)
-          const sortedHelpers = capableHelpers.sort(
-            (a, b) =>
-              helperAssignments[a.helperId].length -
-              helperAssignments[b.helperId].length
-          );
-          const targetHelper = sortedHelpers[0];
-          helperAssignments[targetHelper.helperId].push(queue);
         }
 
         // Update positions and times for all queues
         for (const helperId in helperAssignments) {
-          const helperQueues = helperAssignments[helperId];
-          let position = 1;
+          const assignment = helperAssignments[helperId];
+          let currentPosition = 1;
 
-          // Sort by: currently serving (pos 1) > in_queue > hold/skipped, then by joining time
-          helperQueues.sort((a, b) => {
-            if (a.currentPosition === 1 && a.status === "in_queue") return -1;
-            if (b.currentPosition === 1 && b.status === "in_queue") return 1;
-            if (a.status === "in_queue" && b.status !== "in_queue") return -1;
-            if (b.status === "in_queue" && a.status !== "in_queue") return 1;
-            return a.joiningTime - b.joiningTime;
-          });
-
-          for (const queue of helperQueues) {
+          // Process in_queue people first - they take available positions
+          for (const queue of assignment.inQueue) {
             const oldPosition = queue.currentPosition;
             const oldHelperId = queue.helperId;
             const oldEstimatedWait = queue.estimatedWait;
 
-            const newPosition = position++;
+            // Skip positions blocked by hold people
+            while (
+              assignment.hold.some((h) => h.currentPosition === currentPosition)
+            ) {
+              currentPosition++;
+            }
+
+            const newPosition = currentPosition++;
             const newEstimatedWait = (newPosition - 1) * service.duration;
             const newEstimatedServiceStartTime = new Date(
               Date.now() + newEstimatedWait * 60 * 1000
             );
 
-            // Check if anything changed
+            // Check for changes
             const hasChanges =
               queue.currentPosition !== newPosition ||
               queue.helperId !== helperId ||
-              queue.estimatedWait !== newEstimatedWait;
+              Math.abs(queue.estimatedWait - newEstimatedWait) >= 1;
 
             if (hasChanges) {
               const queueDoc = await Queue.findOne({
@@ -573,7 +525,6 @@ router.post(
               queueDoc.estimatedWait = newEstimatedWait;
               queueDoc.estimatedServiceStartTime = newEstimatedServiceStartTime;
 
-              // Add to update history
               queueDoc.updateHistory.push({
                 action: "edit",
                 source: "vendor",
@@ -590,18 +541,79 @@ router.post(
               await queueDoc.save({ session });
               updatedCount++;
 
-              // Track notification if significant change for normal users
+              // Track notification for normal users
               if (queue.userType === "normal" && queue.userId) {
                 const positionChanged = oldPosition !== newPosition;
                 const helperChanged = helperId !== oldHelperId;
                 const waitTimeChanged =
-                  Math.abs(oldEstimatedWait - newEstimatedWait) >= 5; // 5+ min change
+                  Math.abs(oldEstimatedWait - newEstimatedWait) >= 5;
 
                 if (positionChanged || helperChanged || waitTimeChanged) {
                   notifications.push({
                     userId: queue.userId,
                     oldPosition,
                     newPosition,
+                    estimatedWait: newEstimatedWait,
+                    status: queue.status,
+                    helperChanged,
+                  });
+                }
+              }
+            }
+          }
+
+          // Process hold people - they stay at their current position
+          for (const queue of assignment.hold) {
+            const oldHelperId = queue.helperId;
+            const oldEstimatedWait = queue.estimatedWait;
+
+            // Hold people keep their position but may get new helper
+            const newEstimatedWait =
+              (queue.currentPosition - 1) * service.duration;
+            const newEstimatedServiceStartTime = new Date(
+              Date.now() + newEstimatedWait * 60 * 1000
+            );
+
+            const hasChanges =
+              queue.helperId !== helperId ||
+              Math.abs(queue.estimatedWait - newEstimatedWait) >= 1;
+
+            if (hasChanges) {
+              const queueDoc = await Queue.findOne({
+                _id: queue._id,
+              }).session(session);
+
+              queueDoc.helperId = helperId;
+              queueDoc.estimatedWait = newEstimatedWait;
+              queueDoc.estimatedServiceStartTime = newEstimatedServiceStartTime;
+
+              queueDoc.updateHistory.push({
+                action: "edit",
+                source: "vendor",
+                timestamp: new Date(),
+                previousPosition: queue.currentPosition,
+                newPosition: queue.currentPosition,
+                estimatedWait: newEstimatedWait,
+                serviceId,
+                businessId: vendorId,
+                newlyAssignedHelperId:
+                  helperId !== oldHelperId ? helperId : undefined,
+              });
+
+              await queueDoc.save({ session });
+              updatedCount++;
+
+              // Track notification for normal users
+              if (queue.userType === "normal" && queue.userId) {
+                const helperChanged = helperId !== oldHelperId;
+                const waitTimeChanged =
+                  Math.abs(oldEstimatedWait - newEstimatedWait) >= 5;
+
+                if (helperChanged || waitTimeChanged) {
+                  notifications.push({
+                    userId: queue.userId,
+                    oldPosition: queue.currentPosition,
+                    newPosition: queue.currentPosition,
                     estimatedWait: newEstimatedWait,
                     status: queue.status,
                     helperChanged,
@@ -623,9 +635,16 @@ router.post(
           }).select("pushToken receiveNotifications");
 
           if (user?.receiveNotifications && user.pushToken) {
-            const message = notification.helperChanged
-              ? `Queue updated! Position: ${notification.oldPosition} → ${notification.newPosition}. Helper reassigned. ETA: ${notification.estimatedWait} mins`
-              : `Queue updated! Position: ${notification.oldPosition} → ${notification.newPosition}. ETA: ${notification.estimatedWait} mins`;
+            let message;
+            if (notification.status === "hold") {
+              message = notification.helperChanged
+                ? `Queue updated! You're on HOLD at position ${notification.newPosition}. Helper reassigned. ETA: ${notification.estimatedWait} mins`
+                : `Queue updated! You're on HOLD at position ${notification.newPosition}. ETA: ${notification.estimatedWait} mins`;
+            } else {
+              message = notification.helperChanged
+                ? `Queue updated! Position: ${notification.oldPosition} → ${notification.newPosition}. Helper reassigned. ETA: ${notification.estimatedWait} mins`
+                : `Queue updated! Position: ${notification.oldPosition} → ${notification.newPosition}. ETA: ${notification.estimatedWait} mins`;
+            }
 
             await axios.post(
               "https://exp.host/--/api/v2/push/send",
@@ -640,6 +659,7 @@ router.post(
                     newPosition: notification.newPosition,
                     estimatedWait: notification.estimatedWait,
                     helperChanged: notification.helperChanged,
+                    status: notification.status,
                   },
                 },
               ],
@@ -2558,6 +2578,333 @@ router.post(
       res.status(500).json({
         success: false,
         message: "Failed to retrieve recent actions",
+        data: null,
+      });
+    }
+  }
+);
+
+// Haversine formula to calculate distance between two points (in kilometers)
+const getDistance = (lat1, lon1, lat2, lon2) => {
+  const toRad = (value) => (value * Math.PI) / 180;
+  const R = 6371; // Earth's radius in kilometers
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+};
+
+//Search and Discovery Route
+router.post(
+  "/search-discover",
+  [
+    body("query").optional().isString().withMessage("Query must be a string"),
+    body("businessType")
+      .optional()
+      .isString()
+      .withMessage("Business type must be a string"),
+    body("latitude")
+      .isFloat({ min: -90, max: 90 })
+      .withMessage("Valid latitude is required"),
+    body("longitude")
+      .isFloat({ min: -180, max: 180 })
+      .withMessage("Valid longitude is required"),
+    body("filters.location")
+      .optional()
+      .isBoolean()
+      .withMessage("Location filter must be boolean"),
+    body("filters.locationThreshold")
+      .optional()
+      .isFloat({ min: 0.1 })
+      .withMessage("Location threshold must be positive"),
+    body("filters.rating")
+      .optional()
+      .isBoolean()
+      .withMessage("Rating filter must be boolean"),
+    body("filters.minRating")
+      .optional()
+      .isFloat({ min: 0, max: 5 })
+      .withMessage("Min rating must be between 0 and 5"),
+    body("filters.popularity")
+      .optional()
+      .isBoolean()
+      .withMessage("Popularity filter must be boolean"),
+    body("filters.minPopularity")
+      .optional()
+      .isInt({ min: 0 })
+      .withMessage("Min popularity must be non-negative"),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res
+        .status(400)
+        .json({ success: false, message: errors.array()[0].msg, data: null });
+    }
+
+    const {
+      query = "",
+      businessType = "all",
+      latitude,
+      longitude,
+      filters = {},
+    } = req.body;
+
+    try {
+      // Step 1: Build initial query for active businesses
+      const businessQuery = {
+        accountType: "owner",
+        isDeleted: false,
+        isSuspended: false,
+        active: true,
+      };
+
+      // Step 2: Apply businessType filter (regex if not "all")
+      if (businessType && businessType.toLowerCase() !== "all") {
+        businessQuery.businessType = { $regex: businessType, $options: "i" };
+      }
+
+      // Step 3: Fetch all active businesses
+      let businesses = await Vendor.find(businessQuery)
+        .select(
+          "_id businessName businessType businessAddress workingHours location avatar noOfSeats"
+        )
+        .lean();
+
+      if (businesses.length === 0) {
+        return res.json({
+          success: true,
+          message: "No businesses found",
+          data: [],
+        });
+      }
+
+      const businessIds = businesses.map((b) => b._id);
+
+      // Step 4: Get all active services for these businesses
+      const services = await RateCard.find({
+        createdBy: { $in: businessIds },
+        isDeleted: false,
+      })
+        .select("_id name duration rate gender createdBy")
+        .lean();
+
+      // Map services by business
+      const servicesByBusiness = {};
+      services.forEach((s) => {
+        if (!servicesByBusiness[s.createdBy]) {
+          servicesByBusiness[s.createdBy] = [];
+        }
+        servicesByBusiness[s.createdBy].push(s);
+      });
+
+      // Step 5: Apply search query filter (businessName OR service name)
+      if (query && query.trim() !== "") {
+        const searchRegex = new RegExp(query, "i");
+
+        businesses = businesses.filter((business) => {
+          // Check business name
+          const matchesBusinessName = searchRegex.test(business.businessName);
+
+          // Check service names
+          const businessServices = servicesByBusiness[business._id] || [];
+          const matchesServiceName = businessServices.some((s) =>
+            searchRegex.test(s.name)
+          );
+
+          return matchesBusinessName || matchesServiceName;
+        });
+      }
+
+      if (businesses.length === 0) {
+        return res.json({
+          success: true,
+          message: "No businesses found matching search criteria",
+          data: [],
+        });
+      }
+
+      // Step 6: Calculate distance using Haversine formula
+      const calculateDistance = (lat1, lon1, lat2, lon2) => {
+        const R = 6371; // Earth's radius in km
+        const dLat = ((lat2 - lat1) * Math.PI) / 180;
+        const dLon = ((lon2 - lon1) * Math.PI) / 180;
+        const a =
+          Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+          Math.cos((lat1 * Math.PI) / 180) *
+            Math.cos((lat2 * Math.PI) / 180) *
+            Math.sin(dLon / 2) *
+            Math.sin(dLon / 2);
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        return R * c; // Distance in km
+      };
+
+      // Add distance to each business
+      businesses = businesses.map((business) => ({
+        ...business,
+        distance:
+          business.location?.latitude && business.location?.longitude
+            ? calculateDistance(
+                latitude,
+                longitude,
+                business.location.latitude,
+                business.location.longitude
+              )
+            : null,
+      }));
+
+      // Step 7: Apply location filter if enabled
+      if (filters.location && filters.locationThreshold) {
+        businesses = businesses.filter(
+          (b) => b.distance !== null && b.distance <= filters.locationThreshold
+        );
+      }
+
+      if (businesses.length === 0) {
+        return res.json({
+          success: true,
+          message: "No businesses found within location threshold",
+          data: [],
+        });
+      }
+
+      const finalBusinessIds = businesses.map((b) => b._id);
+
+      // Step 8: Calculate ratings and popularity from Queue collection
+      const queueStats = await Queue.aggregate([
+        {
+          $match: {
+            vendorId: { $in: finalBusinessIds },
+            status: "completed",
+          },
+        },
+        {
+          $group: {
+            _id: "$vendorId",
+            totalCompleted: { $sum: 1 }, // Popularity
+            ratings: { $push: "$rating" },
+          },
+        },
+      ]);
+
+      // Map stats by business
+      const statsByBusiness = {};
+      queueStats.forEach((stat) => {
+        const validRatings = stat.ratings.filter((r) => r != null);
+        const avgRating =
+          validRatings.length > 0
+            ? validRatings.reduce((sum, r) => sum + r, 0) / validRatings.length
+            : 0;
+
+        statsByBusiness[stat._id] = {
+          avgRating: Math.round(avgRating * 10) / 10, // Round to 1 decimal
+          totalCompleted: stat.totalCompleted,
+          ratingCount: validRatings.length,
+        };
+      });
+
+      // Step 9: Apply rating filter if enabled
+      if (filters.rating && filters.minRating != null) {
+        businesses = businesses.filter((b) => {
+          const stats = statsByBusiness[b._id];
+          return stats && stats.avgRating >= filters.minRating;
+        });
+      }
+
+      // Step 10: Apply popularity filter if enabled
+      if (filters.popularity && filters.minPopularity != null) {
+        businesses = businesses.filter((b) => {
+          const stats = statsByBusiness[b._id];
+          return stats && stats.totalCompleted >= filters.minPopularity;
+        });
+      }
+
+      if (businesses.length === 0) {
+        return res.json({
+          success: true,
+          message: "No businesses found matching all filters",
+          data: [],
+        });
+      }
+
+      // Step 11: Get top 3 reviews for each business (completed with rating >= 4)
+      const reviewsData = await Queue.find({
+        vendorId: { $in: businesses.map((b) => b._id) },
+        status: "completed",
+        rating: { $gte: 4, $ne: null },
+      })
+        .populate("userId", "firstName lastName")
+        .select("vendorId rating notes userId createdAt")
+        .sort({ createdAt: -1 })
+        .lean();
+
+      // Group reviews by business (top 3 each)
+      const reviewsByBusiness = {};
+      reviewsData.forEach((review) => {
+        if (!reviewsByBusiness[review.vendorId]) {
+          reviewsByBusiness[review.vendorId] = [];
+        }
+        if (reviewsByBusiness[review.vendorId].length < 3) {
+          reviewsByBusiness[review.vendorId].push({
+            rating: review.rating,
+            notes: review.notes || "",
+            customerName: review.userId
+              ? `${review.userId.firstName} ${review.userId.lastName}`
+              : "Anonymous",
+            date: review.createdAt,
+          });
+        }
+      });
+
+      // Step 12: Build final response
+      const enrichedBusinesses = businesses.map((business) => {
+        const stats = statsByBusiness[business._id] || {
+          avgRating: 0,
+          totalCompleted: 0,
+          ratingCount: 0,
+        };
+
+        return {
+          _id: business._id,
+          businessName: business.businessName,
+          businessType: business.businessType,
+          businessAddress: business.businessAddress,
+          avatar: business.avatar,
+          noOfSeats: business.noOfSeats,
+          workingHours: business.workingHours,
+          location: business.location,
+          distance: business.distance,
+          rating: stats.avgRating,
+          ratingCount: stats.ratingCount,
+          popularity: stats.totalCompleted,
+          services: servicesByBusiness[business._id] || [],
+          reviews: reviewsByBusiness[business._id] || [],
+        };
+      });
+
+      // Step 13: Sort by distance (nearest first)
+      enrichedBusinesses.sort((a, b) => {
+        if (a.distance === null) return 1;
+        if (b.distance === null) return -1;
+        return a.distance - b.distance;
+      });
+
+      res.json({
+        success: true,
+        message: "Businesses retrieved successfully",
+        data: enrichedBusinesses,
+      });
+    } catch (error) {
+      console.error("Error searching businesses:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to search businesses",
         data: null,
       });
     }
