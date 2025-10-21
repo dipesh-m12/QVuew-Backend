@@ -31,6 +31,7 @@ app.use("/api/sms", require("./routes/sms"));
 app.use("/api/ocr", require("./routes/ocr"));
 app.use("/api/gemini", require("./routes/gemini"));
 app.use("/api/upload", require("./routes/upload"));
+app.use("/api/device-login", require("./routes/deviceLogin"));
 //pending
 app.use("/api/queue", require("./routes/queue"));
 

@@ -197,32 +197,46 @@ router.put(
         (ch) => ch._id === helperId
       );
       if (!helperConnection) {
-        return res
-          .status(404)
-          .json({
-            success: false,
-            message: "Helper connection not found",
-            data: null,
-          });
+        return res.status(404).json({
+          success: false,
+          message: "Helper connection not found",
+          data: null,
+        });
       }
 
       // Check authorization: owner can update any, helper can only update their own
       if (
-        business.accountType !== "owner" &&
-        helperConnection.helperId !== userId
+        business.accountType !== "owner" ||
+        (helperConnection.helperId !== userId &&
+          business._id.toString() !== userId)
       ) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "Only owner or the helper themselves can update this connection",
+          data: null,
+        });
+      }
+
+      // Update helper's helperJointBusiness based on status
+      const helper = await Vendor.findById(helperConnection.helperId);
+      if (!helper || helper.isDeleted || helper.isSuspended) {
         return res
-          .status(403)
-          .json({
-            success: false,
-            message:
-              "Only owner or the helper themselves can update this connection",
-            data: null,
-          });
+          .status(404)
+          .json({ success: false, message: "Helper not found", data: null });
+      }
+
+      if (status) {
+        helperConnection.status = status;
+        if (status === "accepted") {
+          helper.helperJointBusiness = business._id.toString();
+        } else if (status === "removed") {
+          helper.helperJointBusiness = "";
+        }
+        await helper.save();
       }
 
       if (active !== undefined) helperConnection.active = active;
-      if (status) helperConnection.status = status;
       if (joiningAcceptedDate)
         helperConnection.joiningAcceptedDate = new Date(joiningAcceptedDate);
       if (associatedServices)

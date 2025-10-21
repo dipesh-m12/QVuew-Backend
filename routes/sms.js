@@ -16,11 +16,7 @@ const twilioClient = twilio(
   process.env.TWILIO_AUTH_TOKEN
 );
 const CODE_TTL = 15 * 60; // 15 minutes in seconds
-console.log(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN,
-  process.env.TWILIO_PHONE_NUMBER
-);
+
 // Generate SMS Code
 router.post(
   "/generate-sms",
